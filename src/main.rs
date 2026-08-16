@@ -1,14 +1,10 @@
-//! Standalone TCP forwarder extracted from ZeroDPI's `ip_bypass` path.
+//! Standalone TCP forwarder.
 //!
-//! Logic taken verbatim from `crates/zerodpi-core/src/proxy.rs`:
-//! - `run_ip_bypass_proxy`          (proxy.rs:1262)
-//! - `handle_ip_bypass_connection`  (proxy.rs:1314)
-//! - `counting_relay`               (proxy.rs:1067)
-//! - `copy_counting`                (proxy.rs:1226)
+//! Listens on a local address, accepts TCP connections, and relays all traffic
+//! verbatim to a configured target. No packet interception, no DPI handling.
 //!
-//! Adaptations: the event channel (`ProxyEvent`/TUI dashboard) and the
-//! `Arc<RwLock<IpAddr>>` hot-swap are dropped; the target IP and relay
-//! settings come from command-line arguments.
+//! Each accepted connection is handled on its own tokio task; the relay is a
+//! bidirectional copy between the inbound and outbound sockets.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,7 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream};
 use tracing::{debug, info, warn};
 
-/// The upstream port. The original constant lives at proxy.rs:336.
+/// The upstream port to connect to by default.
 pub const CONNECT_PORT: u16 = 443;
 
 /// Per-direction relay copy buffer. Larger buffers reduce syscall overhead
@@ -43,7 +39,7 @@ struct Args {
     /// Local address:port to listen on.
     #[arg(long, default_value = "127.0.0.1:44444")]
     listen: String,
-    /// Force-close each relay after this many seconds (0 disables, like RELAY_MAX_LIFETIME_SECS).
+    /// Force-close each relay after this many seconds (0 disables).
     #[arg(long, default_value_t = 0)]
     max_lifetime: u64,
     /// Number of tokio worker threads. Defaults to the CPU count.
@@ -99,9 +95,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
 
 /// Listen for inbound connections and relay each one to `target`.
 ///
-/// Adapted from `run_ip_bypass_proxy` (proxy.rs:1262): each accepted connection
-/// is handled on its own tokio task; the target IP is fixed rather than being
-/// read from a hot-swappable `Arc<RwLock<IpAddr>>`.
+/// The target address is fixed for the lifetime of the process; the accept
+/// loop stays hot by spawning every connection as its own tokio task.
 async fn run_forwarder(
     listen: String,
     target: SocketAddr,
@@ -132,7 +127,7 @@ async fn run_forwarder(
         debug!(%peer, "accepted");
 
         tokio::spawn(async move {
-            if let Err(e) = handle_ip_bypass_connection(target, incoming, peer, relay_max_lifetime).await {
+            if let Err(e) = handle_connection(target, incoming, peer, relay_max_lifetime).await {
                 warn!(%peer, error = %e, "connection failed");
             }
         });
@@ -140,10 +135,7 @@ async fn run_forwarder(
 }
 
 /// Relay one accepted connection to the target.
-///
-/// Copied from `handle_ip_bypass_connection` (proxy.rs:1314) with the
-/// `ProxyEvent` emissions removed.
-async fn handle_ip_bypass_connection(
+async fn handle_connection(
     connect_addr: SocketAddr,
     incoming: TcpStream,
     peer: SocketAddr,
@@ -187,9 +179,6 @@ struct RelayResult {
 }
 
 /// Run a bidirectional relay between `incoming` and `outgoing`.
-///
-/// Copied from `counting_relay` (proxy.rs:1067) with the progress ticker
-/// removed (it only drove the TUI dashboard).
 async fn counting_relay(
     incoming: TcpStream,
     outgoing: TcpStream,
@@ -261,7 +250,7 @@ async fn counting_relay(
 
 /// Copy all bytes from `reader` to `writer`, updating `counter` after each
 /// chunk. Shuts down `writer` gracefully on EOF or error, then returns the
-/// total bytes copied. Copied verbatim from `copy_counting` (proxy.rs:1226).
+/// total bytes copied.
 async fn copy_counting(
     mut reader: tokio::net::tcp::OwnedReadHalf,
     mut writer: tokio::net::tcp::OwnedWriteHalf,
