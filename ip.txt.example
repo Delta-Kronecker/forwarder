@@ -1,0 +1,15 @@
+# Upstream IP list for forwarder.
+#
+# Copy this file to "ip.txt" next to the executable (forwarder.exe) and fill in
+# the upstream addresses you want to rotate through. One IP per line. Lines
+# starting with '#' and blank lines are ignored.
+#
+# When you run forwarder WITHOUT a <target> argument, every accepted connection
+# is relayed to the next unused IP from this list, and no IP is used twice while
+# the process is running. A list of N IPs therefore serves exactly N
+# connections per launch.
+#
+# Example:
+# 23.227.39.200
+# 23.227.38.74
+# 23.227.38.65

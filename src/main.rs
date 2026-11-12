@@ -5,9 +5,18 @@
 //!
 //! Each accepted connection is handled on its own tokio task; the relay is a
 //! bidirectional copy between the inbound and outbound sockets.
+//!
+//! # Upstream IP rotation
+//!
+//! When `<TARGET>` is omitted, the upstream address for every connection is
+//! taken from `ip.txt` next to the executable: one upstream IP per line. Each
+//! accepted connection gets the next unused IP and no IP is ever reused for the
+//! lifetime of the process. Once the list is exhausted, new connections are
+//! refused.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,23 +37,32 @@ const COPY_BUF_SIZE: usize = 128 * 1024;
 /// while the accept task is busy, absorbing bursts like 100 parallel connects.
 const LISTEN_BACKLOG: u32 = 1024;
 
+/// Default name of the upstream-IP list, resolved next to the executable.
+const DEFAULT_IP_FILE: &str = "ip.txt";
+
 #[derive(Debug, Parser)]
-#[command(name = "forwarder", about = "Accept TCP on a local listen address and relay it to a target IP")]
+#[command(name = "forwarder", about = "Accept TCP on a local listen address and relay it to an upstream IP")]
 struct Args {
-    /// Target IPv4/IPv6 address (or hostname) to forward traffic to.
-    target: String,
+    /// Fixed upstream IPv4/IPv6 address (or hostname) to forward to. When
+    /// omitted, upstream IPs are read from --ip-file and rotated per
+    /// connection (each IP used once).
+    target: Option<String>,
     /// Upstream port to connect to.
     #[arg(long, default_value_t = CONNECT_PORT)]
     port: u16,
     /// Local address:port to listen on.
-    #[arg(long, default_value = "127.0.0.1:44444")]
+    #[arg(long, default_value = "127.0.0.1:40443")]
     listen: String,
+    /// File with one upstream IP per line, used when <TARGET> is omitted.
+    /// Resolved next to the executable when relative.
+    #[arg(long, default_value = DEFAULT_IP_FILE)]
+    ip_file: PathBuf,
     /// Force-close each relay after this many seconds (0 disables).
     #[arg(long, default_value_t = 0)]
     max_lifetime: u64,
-    /// Number of tokio worker threads. Defaults to the CPU count.
-    #[arg(long)]
-    workers: Option<usize>,
+    /// Number of tokio worker threads.
+    #[arg(long, default_value_t = 8)]
+    workers: usize,
 }
 
 fn configured_relay_max_lifetime(secs: u64) -> Option<Duration> {
@@ -62,6 +80,90 @@ async fn resolve_target(raw: &str, port: u16) -> anyhow::Result<SocketAddr> {
         .with_context(|| format!("no addresses found for '{raw}'"))
 }
 
+/// A fixed list of upstream addresses, handed out one at a time.
+///
+/// `next` only ever moves forward, so no index is handed out twice and every
+/// address is used for at most one connection per process run.
+struct IpPool {
+    addrs: Vec<SocketAddr>,
+    next: AtomicUsize,
+}
+
+impl IpPool {
+    /// Take the next unused upstream address, or `None` when exhausted.
+    fn take(&self) -> Option<SocketAddr> {
+        let idx = self.next.fetch_add(1, Ordering::Relaxed);
+        self.addrs.get(idx).copied()
+    }
+}
+
+/// Where each connection's upstream address comes from.
+enum TargetSource {
+    /// A single fixed address (`<TARGET>` was given).
+    Fixed(SocketAddr),
+    /// A one-shot pool from `ip.txt` (`<TARGET>` was omitted).
+    Pool(Arc<IpPool>),
+}
+
+impl TargetSource {
+    /// Pick the upstream address for one connection.
+    fn next_address(&self) -> Option<SocketAddr> {
+        match self {
+            TargetSource::Fixed(addr) => Some(*addr),
+            TargetSource::Pool(pool) => pool.take(),
+        }
+    }
+}
+
+/// Resolve a (possibly relative) IP-list path next to the executable.
+///
+/// Relative paths prefer the executable's directory; if that file does not
+/// exist we fall back to the current working directory, which keeps
+/// `cargo run` usable during development.
+fn resolve_ip_file(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    {
+        let candidate = dir.join(path);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Parse the upstream-IP list: one address per line, blank lines and `#`
+/// comments ignored. Leading/trailing whitespace is trimmed.
+fn load_ip_pool(path: &Path, port: u16) -> anyhow::Result<IpPool> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading upstream IP list {}", path.display()))?;
+
+    let mut addrs = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let ip: IpAddr = line
+            .parse()
+            .with_context(|| format!("{}:{}: invalid IP '{line}'", path.display(), i + 1))?;
+        addrs.push(SocketAddr::new(ip, port));
+    }
+
+    if addrs.is_empty() {
+        anyhow::bail!("upstream IP list {} contains no addresses", path.display());
+    }
+
+    Ok(IpPool {
+        addrs,
+        next: AtomicUsize::new(0),
+    })
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -71,35 +173,65 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let workers = args.workers.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-    });
+    let workers = args.workers;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .enable_all()
         .build()
         .context("building tokio runtime")?;
-    runtime.block_on(run(args))
+
+    let result = runtime.block_on(run(args));
+
+    // When launched by double-clicking (no arguments) Windows would close the
+    // console as soon as we return, hiding the error. Keep it open for a moment
+    // so the message can be read.
+    if result.is_err() && std::env::args_os().count() <= 1 {
+        if let Err(e) = &result {
+            eprintln!("\nforwarder stopped:\n  {e:#}\n");
+        }
+        eprintln!("Press Enter to close this window...");
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+    }
+
+    result
 }
 
 async fn run(args: Args) -> anyhow::Result<()> {
-    let target = resolve_target(&args.target, args.port).await?;
     let relay_max_lifetime = configured_relay_max_lifetime(args.max_lifetime);
-    info!(target = %target, listen = %args.listen, max_lifetime = ?relay_max_lifetime, "forwarder starting");
 
-    run_forwarder(args.listen, target, relay_max_lifetime).await
+    let target_source = match args.target.as_deref() {
+        Some(target) => {
+            let addr = resolve_target(target, args.port).await?;
+            info!(target = %addr, listen = %args.listen, max_lifetime = ?relay_max_lifetime, "forwarder starting");
+            TargetSource::Fixed(addr)
+        }
+        None => {
+            let path = resolve_ip_file(&args.ip_file);
+            let pool = Arc::new(load_ip_pool(&path, args.port)?);
+            info!(
+                ip_file = %path.display(),
+                upstream_ips = pool.addrs.len(),
+                port = args.port,
+                listen = %args.listen,
+                max_lifetime = ?relay_max_lifetime,
+                "forwarder starting (rotating upstream IPs, one per connection)"
+            );
+            TargetSource::Pool(pool)
+        }
+    };
+
+    run_forwarder(args.listen, target_source, relay_max_lifetime).await
 }
 
-/// Listen for inbound connections and relay each one to `target`.
+/// Listen for inbound connections and relay each one to its upstream address.
 ///
-/// The target address is fixed for the lifetime of the process; the accept
-/// loop stays hot by spawning every connection as its own tokio task.
+/// The upstream address is chosen per connection; the accept loop stays hot by
+/// spawning every connection as its own tokio task.
 async fn run_forwarder(
     listen: String,
-    target: SocketAddr,
+    target_source: TargetSource,
     relay_max_lifetime: Option<Duration>,
 ) -> anyhow::Result<()> {
     let listen_addr: SocketAddr = listen.parse().context("invalid listen address")?;
@@ -114,7 +246,14 @@ async fn run_forwarder(
     let listener = socket
         .listen(LISTEN_BACKLOG)
         .with_context(|| format!("listen {listen_addr}"))?;
-    info!(%listen_addr, %target, backlog = LISTEN_BACKLOG, "listening");
+    match &target_source {
+        TargetSource::Fixed(target) => {
+            info!(%listen_addr, %target, backlog = LISTEN_BACKLOG, "listening");
+        }
+        TargetSource::Pool(pool) => {
+            info!(%listen_addr, upstream_ips = pool.addrs.len(), backlog = LISTEN_BACKLOG, "listening");
+        }
+    }
 
     loop {
         let (incoming, peer) = match listener.accept().await {
@@ -125,6 +264,16 @@ async fn run_forwarder(
             }
         };
         debug!(%peer, "accepted");
+
+        // Each connection gets its own upstream IP; a pool address is never
+        // handed out twice, so once empty we refuse further connections.
+        let target = match target_source.next_address() {
+            Some(addr) => addr,
+            None => {
+                warn!(%peer, "upstream IP pool exhausted, refusing connection");
+                continue;
+            }
+        };
 
         tokio::spawn(async move {
             if let Err(e) = handle_connection(target, incoming, peer, relay_max_lifetime).await {
