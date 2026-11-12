@@ -17,6 +17,8 @@ forwarder.exe [target] [options]
 | `--port` | `443` | Upstream port to connect to |
 | `--listen` | `127.0.0.1:40443` | Local address:port to listen on |
 | `--ip-file` | `ip.txt` | Upstream IP list, resolved next to the executable when relative |
+| `--proxy` | `127.0.0.1:9050` | SOCKS5 proxy to reach the upstream through. Repeatable to chain hops. Format: `[user:pass@]host:port` |
+| `--no-proxy` | — | Dial the upstream directly, ignoring the default proxy |
 | `--max-lifetime` | `0` | Force-close each relay after N seconds (`0` disables) |
 | `--workers` | `8` | Number of tokio worker threads |
 
@@ -60,6 +62,28 @@ Relative paths are resolved against the executable's directory first, falling
 back to the current working directory (handy for `cargo run`). Override the
 location with `--ip-file`. A template is provided as `ip.txt.example`.
 
+## SOCKS5 proxy chain
+
+Pass one or more SOCKS5 proxies with `--proxy`; each upstream connection is then
+dialled through them, in the order given. **The default is `127.0.0.1:9050`**
+(the usual Tor SOCKS port), so with no arguments every upstream connection goes
+through a local Tor instance. With a single proxy it is a plain
+`forwarder → proxy → upstream` chain; repeat `--proxy` to tunnel through several
+hops, and the last proxy opens the connection to the upstream IP:
+
+```
+forwarder.exe --proxy 127.0.0.1:9050
+forwarder.exe --proxy 10.0.0.1:1080 --proxy 10.0.0.2:1080
+forwarder.exe --proxy alice:s3cret@127.0.0.1:1080
+forwarder.exe --no-proxy        # connect straight to the upstream
+```
+
+Format is `[user:pass@]host:port`. Credentials use SOCKS5 username/password
+auth (RFC 1929) and are offered only when set; otherwise no-auth is used. IPv6
+proxies use brackets, e.g. `[::1]:1080`. Hostnames are resolved at startup.
+
+Use `--no-proxy` to skip the default and dial the upstream directly.
+
 ## Logging
 
 Every accepted connection is logged at `info` level together with the upstream
@@ -89,6 +113,7 @@ require Visual Studio C++ build tools.
   tokio task per connection
 - upstream selection — a fixed `<target>`, or the next unused IP from `ip.txt`
   (never reused)
+- dialer — direct TCP, or a chained SOCKS5 CONNECT handshake (`--proxy`)
 - per-connection handler — connects upstream, sets `TCP_NODELAY`, relays
 - bidirectional relay — two copy tasks, one per direction, with graceful
   shutdown and optional max lifetime

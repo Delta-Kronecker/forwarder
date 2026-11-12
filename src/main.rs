@@ -13,6 +13,12 @@
 //! accepted connection gets the next unused IP and no IP is ever reused for the
 //! lifetime of the process. Once the list is exhausted, new connections are
 //! refused.
+//!
+//! # SOCKS5 proxy
+//!
+//! Upstream connections are dialled through a SOCKS5 proxy, defaulting to
+//! `127.0.0.1:9050`. Repeat `--proxy` to chain several hops, or pass
+//! `--no-proxy` to connect directly.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -40,6 +46,18 @@ const LISTEN_BACKLOG: u32 = 1024;
 /// Default name of the upstream-IP list, resolved next to the executable.
 const DEFAULT_IP_FILE: &str = "ip.txt";
 
+/// Default SOCKS5 proxy (e.g. a local Tor daemon on 9050).
+const DEFAULT_PROXY: &str = "127.0.0.1:9050";
+
+/// SOCKS5 protocol constants (RFC 1928 / RFC 1929).
+const SOCKS5_VERSION: u8 = 0x05;
+const SOCKS5_AUTH_NONE: u8 = 0x00;
+const SOCKS5_AUTH_USERPASS: u8 = 0x02;
+const SOCKS5_CMD_CONNECT: u8 = 0x01;
+const SOCKS5_ATYP_IPV4: u8 = 0x01;
+const SOCKS5_ATYP_DOMAIN: u8 = 0x03;
+const SOCKS5_ATYP_IPV6: u8 = 0x04;
+
 #[derive(Debug, Parser)]
 #[command(name = "forwarder", about = "Accept TCP on a local listen address and relay it to an upstream IP")]
 struct Args {
@@ -57,6 +75,13 @@ struct Args {
     /// Resolved next to the executable when relative.
     #[arg(long, default_value = DEFAULT_IP_FILE)]
     ip_file: PathBuf,
+    /// SOCKS5 proxy to reach the upstream through. Repeatable; hops are chained
+    /// in order. Format: [user:pass@]host:port
+    #[arg(long = "proxy", value_name = "SPEC", default_value = DEFAULT_PROXY)]
+    proxy: Vec<String>,
+    /// Dial the upstream directly, ignoring the default proxy.
+    #[arg(long)]
+    no_proxy: bool,
     /// Force-close each relay after this many seconds (0 disables).
     #[arg(long, default_value_t = 0)]
     max_lifetime: u64,
@@ -164,6 +189,217 @@ fn load_ip_pool(path: &Path, port: u16) -> anyhow::Result<IpPool> {
     })
 }
 
+/// One hop in the SOCKS5 chain: where to connect and how to authenticate.
+struct ProxyHop {
+    addr: SocketAddr,
+    user: Option<String>,
+    pass: Option<String>,
+}
+
+/// Split `host:port`, accepting bracketed IPv6 (`[::1]:1080`).
+fn split_host_port(spec: &str) -> anyhow::Result<(&str, u16)> {
+    let spec = spec.trim();
+    if let Some(rest) = spec.strip_prefix('[') {
+        let (host, after) = rest
+            .split_once(']')
+            .context("missing ']' in IPv6 proxy address")?;
+        let port = after
+            .strip_prefix(':')
+            .context("missing ':port' after ']'")?
+            .parse()
+            .context("invalid proxy port")?;
+        return Ok((host, port));
+    }
+    let (host, port) = spec
+        .rsplit_once(':')
+        .context("expected host:port")?;
+    Ok((host, port.parse().context("invalid proxy port")?))
+}
+
+/// Resolve one `[user:pass@]host:port` proxy spec into a concrete hop.
+async fn resolve_proxy(spec: &str) -> anyhow::Result<ProxyHop> {
+    let (creds, hostport) = match spec.rsplit_once('@') {
+        Some((creds, hostport)) => (Some(creds), hostport),
+        None => (None, spec),
+    };
+    let (user, pass) = match creds {
+        Some(creds) => {
+            let (user, pass) = creds
+                .split_once(':')
+                .with_context(|| format!("proxy '{spec}': credentials must be user:pass"))?;
+            (Some(user.to_string()), Some(pass.to_string()))
+        }
+        None => (None, None),
+    };
+
+    let (host, port) =
+        split_host_port(hostport).with_context(|| format!("proxy '{spec}'"))?;
+    let addr = match host.parse::<IpAddr>() {
+        Ok(ip) => SocketAddr::new(ip, port),
+        Err(_) => tokio::net::lookup_host((host, port))
+            .await
+            .with_context(|| format!("resolving proxy '{host}'"))?
+            .next()
+            .with_context(|| format!("no addresses found for proxy '{host}'"))?,
+    };
+
+    Ok(ProxyHop { addr, user, pass })
+}
+
+async fn resolve_proxies(specs: &[String]) -> anyhow::Result<Vec<ProxyHop>> {
+    let mut hops = Vec::with_capacity(specs.len());
+    for spec in specs {
+        hops.push(resolve_proxy(spec).await?);
+    }
+    Ok(hops)
+}
+
+/// Perform a SOCKS5 CONNECT handshake on an already-connected `stream`,
+/// authenticating to the proxy at the far end with `hop`'s credentials, and
+/// return the same `stream` now tunnelled to `target`.
+async fn socks5_connect(
+    mut stream: TcpStream,
+    target: SocketAddr,
+    hop: &ProxyHop,
+) -> anyhow::Result<TcpStream> {
+    // Greeting: offer no-auth, plus user/pass when credentials are configured.
+    let mut methods = vec![SOCKS5_AUTH_NONE];
+    if hop.user.is_some() {
+        methods.push(SOCKS5_AUTH_USERPASS);
+    }
+    let mut greeting = Vec::with_capacity(2 + methods.len());
+    greeting.push(SOCKS5_VERSION);
+    greeting.push(methods.len() as u8);
+    greeting.extend_from_slice(&methods);
+    stream
+        .write_all(&greeting)
+        .await
+        .context("sending SOCKS5 greeting")?;
+
+    let mut chosen = [0u8; 2];
+    stream
+        .read_exact(&mut chosen)
+        .await
+        .context("reading SOCKS5 greeting reply")?;
+    if chosen[0] != SOCKS5_VERSION {
+        anyhow::bail!("SOCKS5: unexpected version {:#04x}", chosen[0]);
+    }
+    match chosen[1] {
+        SOCKS5_AUTH_NONE => {}
+        SOCKS5_AUTH_USERPASS => {
+            let user = hop.user.as_deref().unwrap_or("");
+            let pass = hop.pass.as_deref().unwrap_or("");
+            let mut auth = Vec::with_capacity(3 + user.len() + pass.len());
+            auth.push(0x01); // username/password auth subnegotiation version
+            auth.push(user.len() as u8);
+            auth.extend_from_slice(user.as_bytes());
+            auth.push(pass.len() as u8);
+            auth.extend_from_slice(pass.as_bytes());
+            stream
+                .write_all(&auth)
+                .await
+                .context("sending SOCKS5 credentials")?;
+
+            let mut auth_reply = [0u8; 2];
+            stream
+                .read_exact(&mut auth_reply)
+                .await
+                .context("reading SOCKS5 auth reply")?;
+            if auth_reply[1] != 0x00 {
+                anyhow::bail!("SOCKS5: authentication failed (status {:#04x})", auth_reply[1]);
+            }
+        }
+        method => anyhow::bail!("SOCKS5: no acceptable auth method (server chose {method:#04x})"),
+    }
+
+    // CONNECT request.
+    let mut request = Vec::with_capacity(4 + 16 + 2);
+    request.push(SOCKS5_VERSION);
+    request.push(SOCKS5_CMD_CONNECT);
+    request.push(0x00); // reserved
+    match target {
+        SocketAddr::V4(v4) => {
+            request.push(SOCKS5_ATYP_IPV4);
+            request.extend_from_slice(&v4.ip().octets());
+        }
+        SocketAddr::V6(v6) => {
+            request.push(SOCKS5_ATYP_IPV6);
+            request.extend_from_slice(&v6.ip().octets());
+        }
+    }
+    request.extend_from_slice(&target.port().to_be_bytes());
+    stream
+        .write_all(&request)
+        .await
+        .context("sending SOCKS5 CONNECT")?;
+
+    // Reply: VER REP RSV ATYP BND.ADDR BND.PORT
+    let mut head = [0u8; 4];
+    stream
+        .read_exact(&mut head)
+        .await
+        .context("reading SOCKS5 CONNECT reply")?;
+    if head[0] != SOCKS5_VERSION {
+        anyhow::bail!("SOCKS5: unexpected reply version {:#04x}", head[0]);
+    }
+    if head[1] != 0x00 {
+        anyhow::bail!("SOCKS5: connect failed (reply {:#04x})", head[1]);
+    }
+    match head[3] {
+        SOCKS5_ATYP_IPV4 => {
+            let mut bound = [0u8; 4];
+            stream.read_exact(&mut bound).await.context("SOCKS5 bound address")?;
+        }
+        SOCKS5_ATYP_IPV6 => {
+            let mut bound = [0u8; 16];
+            stream.read_exact(&mut bound).await.context("SOCKS5 bound address")?;
+        }
+        SOCKS5_ATYP_DOMAIN => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await.context("SOCKS5 bound address")?;
+            let mut bound = vec![0u8; len[0] as usize];
+            stream.read_exact(&mut bound).await.context("SOCKS5 bound address")?;
+        }
+        atyp => anyhow::bail!("SOCKS5: bad bound address type {atyp:#04x}"),
+    }
+    let mut bound_port = [0u8; 2];
+    stream
+        .read_exact(&mut bound_port)
+        .await
+        .context("SOCKS5 bound port")?;
+
+    Ok(stream)
+}
+
+/// Connect to `target`, optionally through a chain of SOCKS5 proxies.
+async fn connect_upstream(
+    proxies: &[ProxyHop],
+    target: SocketAddr,
+) -> anyhow::Result<TcpStream> {
+    let Some((first, rest)) = proxies.split_first() else {
+        return TcpStream::connect(target)
+            .await
+            .with_context(|| format!("connect {target}"));
+    };
+
+    let mut stream = TcpStream::connect(first.addr)
+        .await
+        .with_context(|| format!("connect proxy {}", first.addr))?;
+    let _ = stream.set_nodelay(true);
+
+    // Each hop is reached by CONNECTing through the previous proxy.
+    let mut peer = first;
+    for hop in rest {
+        stream = socks5_connect(stream, hop.addr, peer)
+            .await
+            .with_context(|| format!("SOCKS5 hop to proxy {}", hop.addr))?;
+        peer = hop;
+    }
+    socks5_connect(stream, target, peer)
+        .await
+        .with_context(|| format!("SOCKS5 to target {target}"))
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -200,6 +436,18 @@ fn main() -> anyhow::Result<()> {
 
 async fn run(args: Args) -> anyhow::Result<()> {
     let relay_max_lifetime = configured_relay_max_lifetime(args.max_lifetime);
+    let proxies = if args.no_proxy {
+        Vec::new()
+    } else {
+        resolve_proxies(&args.proxy).await?
+    };
+    let proxies = Arc::new(proxies);
+    if proxies.is_empty() {
+        info!("connecting upstream directly (no proxy)");
+    } else {
+        let hops: Vec<SocketAddr> = proxies.iter().map(|h| h.addr).collect();
+        info!(hops = hops.len(), ?hops, "routing upstream through SOCKS5 proxy chain");
+    }
 
     let target_source = match args.target.as_deref() {
         Some(target) => {
@@ -222,7 +470,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         }
     };
 
-    run_forwarder(args.listen, target_source, relay_max_lifetime).await
+    run_forwarder(args.listen, target_source, proxies, relay_max_lifetime).await
 }
 
 /// Listen for inbound connections and relay each one to its upstream address.
@@ -232,6 +480,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
 async fn run_forwarder(
     listen: String,
     target_source: TargetSource,
+    proxies: Arc<Vec<ProxyHop>>,
     relay_max_lifetime: Option<Duration>,
 ) -> anyhow::Result<()> {
     let listen_addr: SocketAddr = listen.parse().context("invalid listen address")?;
@@ -275,8 +524,11 @@ async fn run_forwarder(
             }
         };
 
+        let proxies = Arc::clone(&proxies);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(target, incoming, peer, relay_max_lifetime).await {
+            if let Err(e) =
+                handle_connection(target, incoming, peer, proxies, relay_max_lifetime).await
+            {
                 warn!(%peer, error = %e, "connection failed");
             }
         });
@@ -288,25 +540,25 @@ async fn handle_connection(
     connect_addr: SocketAddr,
     incoming: TcpStream,
     peer: SocketAddr,
+    proxies: Arc<Vec<ProxyHop>>,
     relay_max_lifetime: Option<Duration>,
 ) -> anyhow::Result<()> {
-    info!(%peer, upstream = %connect_addr, "forwarding connection");
+    let via_proxy = !proxies.is_empty();
+    info!(%peer, upstream = %connect_addr, via_proxy, "forwarding connection");
 
     // TCP_NODELAY disables Nagle so small request/response exchanges don't
     // wait on delayed ACKs.
     let _ = incoming.set_nodelay(true);
-    let outgoing = match TcpStream::connect(connect_addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(e).context("connect upstream");
-        }
-    };
+    let outgoing = connect_upstream(&proxies, connect_addr)
+        .await
+        .with_context(|| format!("connect upstream {connect_addr}"))?;
     let _ = outgoing.set_nodelay(true);
 
     let relay = counting_relay(incoming, outgoing, relay_max_lifetime).await;
     info!(
         %peer,
         upstream = %connect_addr,
+        via_proxy,
         c2s_bytes = relay.c2s_bytes,
         s2c_bytes = relay.s2c_bytes,
         reason = ?relay.reason,
