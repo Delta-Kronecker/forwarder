@@ -60,6 +60,19 @@ Relative paths are resolved against the executable's directory first, falling
 back to the current working directory (handy for `cargo run`). Override the
 location with `--ip-file`. A template is provided as `ip.txt.example`.
 
+## Logging
+
+Every accepted connection is logged at `info` level together with the upstream
+IP it was relayed to, and again when the relay finishes:
+
+```
+INFO forwarding connection peer=127.0.0.1:52344 upstream=23.227.38.74
+INFO relay finished peer=127.0.0.1:52344 upstream=23.227.38.74 c2s_bytes=812 s2c_bytes=4096 reason=Completed
+```
+
+Set `RUST_LOG=debug` for extra detail (accept events), or `RUST_LOG=off` to
+silence everything.
+
 ## Build
 
 ```

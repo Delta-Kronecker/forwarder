@@ -290,7 +290,7 @@ async fn handle_connection(
     peer: SocketAddr,
     relay_max_lifetime: Option<Duration>,
 ) -> anyhow::Result<()> {
-    debug!(%peer, %connect_addr, "forwarding connection");
+    info!(%peer, upstream = %connect_addr, "forwarding connection");
 
     // TCP_NODELAY disables Nagle so small request/response exchanges don't
     // wait on delayed ACKs.
@@ -304,7 +304,9 @@ async fn handle_connection(
     let _ = outgoing.set_nodelay(true);
 
     let relay = counting_relay(incoming, outgoing, relay_max_lifetime).await;
-    debug!(
+    info!(
+        %peer,
+        upstream = %connect_addr,
         c2s_bytes = relay.c2s_bytes,
         s2c_bytes = relay.s2c_bytes,
         reason = ?relay.reason,
